@@ -1,0 +1,259 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_IMAGE_FRONTEND = 'crypto-mlops-frontend'
+        DOCKER_IMAGE_BACKEND = 'crypto-mlops-backend'
+        DOCKER_TAG = "${env.BUILD_NUMBER}"
+        PYTHON_VERSION = '3.11'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                echo "Building commit: ${env.GIT_COMMIT}"
+            }
+        }
+        
+        stage('Code Quality Check') {
+            parallel {
+                stage('Python Linting') {
+                    steps {
+                        script {
+                            docker.image('python:3.11-slim').inside {
+                                sh '''
+                                    pip install flake8 pylint black
+                                    cd backend
+                                    flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+                                    pylint --disable=C0114,C0116 **/*.py || true
+                                    black --check . || true
+                                '''
+                            }
+                        }
+                    }
+                }
+                
+                stage('Security Scan') {
+                    steps {
+                        script {
+                            docker.image('python:3.11-slim').inside {
+                                sh '''
+                                    pip install bandit safety
+                                    cd backend
+                                    bandit -r . -f json -o bandit-report.json || true
+                                    safety check || true
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            parallel {
+                stage('Backend Tests') {
+                    steps {
+                        script {
+                            docker.image('python:3.11-slim').inside {
+                                sh '''
+                                    pip install pytest pytest-cov
+                                    cd backend
+                                    pip install -r requirements.txt
+                                    pytest --cov=ml_models --cov-report=xml --cov-report=html || true
+                                '''
+                            }
+                        }
+                    }
+                    post {
+                        always {
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'backend/htmlcov',
+                                reportFiles: 'index.html',
+                                reportName: 'Backend Coverage Report'
+                            ])
+                        }
+                    }
+                }
+                
+                stage('Frontend Tests') {
+                    steps {
+                        script {
+                            docker.image('python:3.11-slim').inside {
+                                sh '''
+                                    pip install pytest
+                                    cd frontend
+                                    pip install -r requirements.txt
+                                    python -c "import streamlit; print('Streamlit import successful')" || true
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build Docker Images') {
+            parallel {
+                stage('Build Frontend Image') {
+                    steps {
+                        script {
+                            docker.build("${DOCKER_IMAGE_FRONTEND}:${DOCKER_TAG}", "./frontend")
+                            docker.tag("${DOCKER_IMAGE_FRONTEND}:${DOCKER_TAG}", "${DOCKER_IMAGE_FRONTEND}:latest")
+                        }
+                    }
+                }
+                
+                stage('Build Backend Image') {
+                    steps {
+                        script {
+                            docker.build("${DOCKER_IMAGE_BACKEND}:${DOCKER_TAG}", "./backend")
+                            docker.tag("${DOCKER_IMAGE_BACKEND}:${DOCKER_TAG}", "${DOCKER_IMAGE_BACKEND}:latest")
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            steps {
+                script {
+                    // Start services for integration testing
+                    sh '''
+                        docker-compose -f docker-compose.test.yml up -d
+                        sleep 30
+                        
+                        # Test backend health
+                        curl -f http://localhost:8000/health || exit 1
+                        
+                        # Test frontend health
+                        curl -f http://localhost:8501/_stcore/health || exit 1
+                        
+                        # Test API endpoints
+                        curl -f http://localhost:8000/ || exit 1
+                        curl -f http://localhost:8000/cryptocurrencies || exit 1
+                        
+                        docker-compose -f docker-compose.test.yml down
+                    '''
+                }
+            }
+        }
+        
+        stage('ML Model Validation') {
+            steps {
+                script {
+                    docker.image('python:3.11-slim').inside {
+                        sh '''
+                            pip install tensorflow scikit-learn pandas numpy
+                            cd ml_models
+                            
+                            # Test LSTM model
+                            python -c "
+import sys
+sys.path.append('..')
+from lstm_model import LSTMModel
+import pandas as pd
+import numpy as np
+
+# Create mock data
+dates = pd.date_range('2023-01-01', periods=100, freq='D')
+prices = np.random.randn(100).cumsum() + 100
+data = pd.DataFrame({'Close': prices}, index=dates)
+
+# Test model
+model = LSTMModel()
+try:
+    predictions, dates, metrics = model.predict(data, days=5)
+    print(f'LSTM Model Test: SUCCESS')
+    print(f'Metrics: {metrics}')
+except Exception as e:
+    print(f'LSTM Model Test: FAILED - {e}')
+    sys.exit(1)
+                            "
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    sh '''
+                        docker-compose -f docker-compose.staging.yml down || true
+                        docker-compose -f docker-compose.staging.yml up -d
+                        
+                        # Wait for services to be ready
+                        sleep 60
+                        
+                        # Run smoke tests
+                        curl -f http://staging.crypto-mlops.local/health || exit 1
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // Deploy to production
+                    sh '''
+                        docker-compose -f docker-compose.prod.yml down || true
+                        docker-compose -f docker-compose.prod.yml up -d
+                        
+                        # Wait for services to be ready
+                        sleep 60
+                        
+                        # Run production health checks
+                        curl -f https://crypto-mlops.com/health || exit 1
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Cleanup
+            sh '''
+                docker system prune -f || true
+                docker image prune -f || true
+            '''
+        }
+        
+        success {
+            echo "Pipeline completed successfully!"
+            // Send success notification
+            emailext (
+                subject: "Pipeline SUCCESS: ${env.JOB_NAME} [${env.BUILD_NUMBER}]",
+                body: "Pipeline completed successfully for commit ${env.GIT_COMMIT}",
+                recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+            )
+        }
+        
+        failure {
+            echo "Pipeline failed!"
+            // Send failure notification
+            emailext (
+                subject: "Pipeline FAILED: ${env.JOB_NAME} [${env.BUILD_NUMBER}]",
+                body: "Pipeline failed for commit ${env.GIT_COMMIT}. Check console output for details.",
+                recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+            )
+        }
+        
+        cleanup {
+            // Cleanup workspace
+            cleanWs()
+        }
+    }
+} 
